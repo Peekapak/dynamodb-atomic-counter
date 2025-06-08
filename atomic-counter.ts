@@ -2,224 +2,299 @@
  * dynamodb-atomic-counter - (c) 2015 Sergio Alcantara
  * Generates unique identifiers using DynamoDB atomic counter update operations.
  * 
+ * Updated for AWS SDK v3 and TypeScript
  * @author Sergio Alcantara
  */
 
-	/**
-	 * Default name of the DynamoDB table where the atomic counters will be stored.
-	 */
-var DEFAULT_TABLE_NAME = 'AtomicCounters',
-	/**
-	 * Default attribute name that will identify each counter.
-	 */
-	DEFAULT_KEY_ATTRIBUTE = 'id',
-	/**
-	 * Default attribute name of the count value attribute.
-	 * The count attribute indicates the "last value" used in the last increment operation.
-	 */
-	DEFAULT_COUNT_ATTRIBUTE = 'lastValue',
-	/**
-	 * Default increment value.
-	 */
-	DEFAULT_INCREMENT = 1;
-
-var dynamo,
-	AWS = require( 'aws-sdk' ),
-	_ = require( 'underscore' );
-
-_.mixin( require('underscore.deferred') );
-
+import {
+	DynamoDBClient,
+	UpdateItemCommand,
+	GetItemCommand,
+	UpdateItemCommandInput,
+	GetItemCommandInput,
+	AttributeValue
+} from '@aws-sdk/client-dynamodb';
 
 /**
- * A convinience "no operation" function.
+ * Default name of the DynamoDB table where the atomic counters will be stored.
  */
-var noop = function(){};
+const DEFAULT_TABLE_NAME = 'AtomicCounters';
 
 /**
- * Make the `AWS.DynamoDB.config` method available.
+ * Default attribute name that will identify each counter.
  */
-exports.config = AWS.config;
+const DEFAULT_KEY_ATTRIBUTE = 'id';
+
+/**
+ * Default attribute name of the count value attribute.
+ * The count attribute indicates the "last value" used in the last increment operation.
+ */
+const DEFAULT_COUNT_ATTRIBUTE = 'lastValue';
+
+/**
+ * Default increment value.
+ */
+const DEFAULT_INCREMENT = 1;
+
+// Global DynamoDB client instance
+let dynamoClient: DynamoDBClient | null = null;
+
+/**
+ * Options for increment and getLastValue operations
+ */
+export interface AtomicCounterOptions {
+	tableName?: string;
+	keyAttribute?: string;
+	countAttribute?: string;
+	increment?: number;
+	success?: (value: number) => void;
+	error?: (error: any) => void;
+	complete?: (valueOrError: number | any) => void;
+	context?: any;
+	dynamodb?: Partial<UpdateItemCommandInput | GetItemCommandInput>;
+	client?: DynamoDBClient;
+}
+
+/**
+ * Promise-like interface for compatibility with original API
+ */
+export interface AtomicCounterPromise {
+	done(callback: (value: number) => void): AtomicCounterPromise;
+	fail(callback: (error: any) => void): AtomicCounterPromise;
+	always(callback: (valueOrError: number | any) => void): AtomicCounterPromise;
+}
+
+/**
+ * Internal promise implementation
+ */
+class AtomicCounterPromiseImpl implements AtomicCounterPromise {
+	private doneCallbacks: Array<(value: number) => void> = [];
+	private failCallbacks: Array<(error: any) => void> = [];
+	private alwaysCallbacks: Array<(valueOrError: number | any) => void> = [];
+	private resolved = false;
+	private rejected = false;
+	private value: number | any;
+
+	constructor(private promise: Promise<number>) {
+		this.promise
+			.then((value) => {
+				this.resolved = true;
+				this.value = value;
+				this.doneCallbacks.forEach(cb => cb(value));
+				this.alwaysCallbacks.forEach(cb => cb(value));
+			})
+			.catch((error) => {
+				this.rejected = true;
+				this.value = error;
+				this.failCallbacks.forEach(cb => cb(error));
+				this.alwaysCallbacks.forEach(cb => cb(error));
+			});
+	}
+
+	done(callback: (value: number) => void): AtomicCounterPromise {
+		if (this.resolved) {
+			callback(this.value);
+		} else if (!this.rejected) {
+			this.doneCallbacks.push(callback);
+		}
+		return this;
+	}
+
+	fail(callback: (error: any) => void): AtomicCounterPromise {
+		if (this.rejected) {
+			callback(this.value);
+		} else if (!this.resolved) {
+			this.failCallbacks.push(callback);
+		}
+		return this;
+	}
+
+	always(callback: (valueOrError: number | any) => void): AtomicCounterPromise {
+		if (this.resolved || this.rejected) {
+			callback(this.value);
+		} else {
+			this.alwaysCallbacks.push(callback);
+		}
+		return this;
+	}
+}
+
+/**
+ * Get or create DynamoDB client
+ */
+function getDynamoClient(clientOverride?: DynamoDBClient): DynamoDBClient {
+	if (clientOverride) {
+		return clientOverride;
+	}
+
+	if (!dynamoClient) {
+		dynamoClient = new DynamoDBClient({});
+	}
+
+	return dynamoClient;
+}
+
+/**
+ * Execute callbacks with optional context
+ */
+function executeCallback(
+	callback: Function | undefined,
+	context: any | undefined,
+	args: any[]
+): void {
+	if (callback && typeof callback === 'function') {
+		if (context) {
+			callback.apply(context, args);
+		} else {
+			callback(...args);
+		}
+	}
+}
 
 /**
  * Increments the counter for the specified `counterId`.
- * It returns an AWS-SDK request instance with a jQuery style promise interface applied to it.
- * See [jQuery documentation](http://api.jquery.com/category/deferred-object/) to find out how to attach callbacks
- * to the returned object using the methods: done, fail, always, and then.
+ * It returns a promise-like object with jQuery-style done/fail/always methods.
  *
- * @method increment
- * @param {String} counterId The name or identifier of the counter to increment.
- * @param {Object} options An options object to overwrite some of the default behaviour of the increment operation.
- * @param {String} options.tableName The name of the DynamoDB table that stores the counters. If not specified, it uses "AtomicCounters" by default.
- * @param {String} options.keyAttribute The name of the attribute that stores the counter name/identifier. If not specified, it uses "id" by default.
- * @param {String} options.countAttribute The name of the attribute that stores the last value generated for the specified `counterId`.
- *    If not specified, it uses "lastValue" by default.
- * @param {Integer} options.increment Specifies by how much the counter should be incremented. If not specified, it uses 1 by default.
- * @param {Function} options.success Success callback function. It receives a single argument: the value (integer) generated by this
- *    increment operation for the specified `counterId`.
- * @param {Function} options.error Error callback function. If the DynamoDB UpdateItem request fails, the error callback is executed.
- *    It receives a single argument: the error object returned from AWS-SDK.
- * @param {Function} options.complete Complete callback function. This callback is executed when the increment operation is completed,
- *    whether or not it was successful. It receives a single argument: a number, if the operation was successful, or an error object if it failed.
- * @param options.context The context object to use in all callbacks. If specified, the value of `this`
- *    within all callbacks will be `options.context`.
- * @param {Object} options.dynamodb Additional DynamoDB parameters. These parameters will be added to the parameters sent in the
- *    [update item](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/DynamoDB.html#updateItem-property) request.
- * @return {Request} A DynamoDB UpdateItem [request](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/Request.html) object,
- *    with a [jQuery](http://api.jquery.com/category/deferred-object/) style promise interface applied to it.
+ * @param counterId The name or identifier of the counter to increment.
+ * @param options An options object to overwrite some of the default behaviour of the increment operation.
+ * @returns A promise-like object with done/fail/always methods
  */
-exports.increment = function ( counterId, options ) {
-	options || ( options = {} );
+export function increment(counterId: string, options: AtomicCounterOptions = {}): AtomicCounterPromise {
+	const client = getDynamoClient(options.client);
+	const keyAttribute = options.keyAttribute || DEFAULT_KEY_ATTRIBUTE;
+	const countAttribute = options.countAttribute || DEFAULT_COUNT_ATTRIBUTE;
+	const incrementValue = options.increment || DEFAULT_INCREMENT;
 
-	var request,
-		deferred = new _.Deferred(),
-		params = {
-			Key: {},
-			AttributeUpdates: {},
-			ReturnValues: 'UPDATED_NEW',
-			TableName: options.tableName || DEFAULT_TABLE_NAME
+	const params: UpdateItemCommandInput = {
+		TableName: options.tableName || DEFAULT_TABLE_NAME,
+		Key: {
+			[keyAttribute]: { S: counterId }
 		},
-		keyAttribute = options.keyAttribute || DEFAULT_KEY_ATTRIBUTE,
-		countAttribute = options.countAttribute || DEFAULT_COUNT_ATTRIBUTE,
-		errorFn = _.isFunction( options.error ) ? options.error : noop,
-		successFn = _.isFunction( options.success ) ? options.success : noop,
-		completeFn = _.isFunction( options.complete ) ? options.complete : noop;
-
-	params.Key[ keyAttribute ] = { S: counterId };
-	params.AttributeUpdates[ countAttribute ] = {
-		Action: 'ADD',
-		Value: {
-			N: '' + ( options.increment || DEFAULT_INCREMENT )
-		}
+		UpdateExpression: `ADD ${countAttribute} :increment`,
+		ExpressionAttributeValues: {
+			':increment': { N: incrementValue.toString() }
+		},
+		ReturnValues: 'UPDATED_NEW',
+		...options.dynamodb
 	};
-	_.extend( params, options.dynamodb );
 
-	dynamo || ( dynamo = new AWS.DynamoDB() );
+	const promise = new Promise<number>((resolve, reject) => {
+		const command = new UpdateItemCommand(params);
 
-	request = dynamo.updateItem(params, function (error, data) {
-		var newCountValue;
+		client.send(command)
+			.then((data) => {
+				try {
+					if (!data.Attributes || !data.Attributes[countAttribute]) {
+						throw new Error('No count attribute returned from DynamoDB');
+					}
 
-		try {
-			if ( error ) {
-				throw error;
-			}
+					const countValue = data.Attributes[countAttribute];
+					if (!countValue.N) {
+						throw new Error('Count attribute is not a number');
+					}
 
-			// Try to parse the count value. An exception will be thrown if it's not a valid number.
-			newCountValue = parseInt( data.Attributes[ countAttribute ].N, 10 );
+					const newCountValue = parseInt(countValue.N, 10);
 
-			if ( !_.isNumber( newCountValue ) || _.isNaN( newCountValue ) ) {
-				throw 'Could not parse incremented value (' + newCountValue + ').';
-			}
-		} catch ( e ) {
-			if ( options.context ) {
-				deferred.rejectWith( options.context, [ e ] );
-			} else {
-				deferred.reject( e );
-			}
+					if (isNaN(newCountValue)) {
+						throw new Error(`Could not parse incremented value (${countValue.N})`);
+					}
 
-			return;
-		}
+					executeCallback(options.success, options.context, [newCountValue]);
+					executeCallback(options.complete, options.context, [newCountValue]);
 
-		if ( options.context ) {
-			deferred.resolveWith( options.context, [ newCountValue ] );
-		} else {
-			deferred.resolve( newCountValue );
-		}
+					resolve(newCountValue);
+				} catch (error) {
+					executeCallback(options.error, options.context, [error]);
+					executeCallback(options.complete, options.context, [error]);
+					reject(error);
+				}
+			})
+			.catch((error) => {
+				executeCallback(options.error, options.context, [error]);
+				executeCallback(options.complete, options.context, [error]);
+				reject(error);
+			});
 	});
 
-	/**
-	 * Apply a promise interface to `request`, set the success, error, and complete callback, and return the promise.
-	 */
-	return deferred.promise( request ).done( successFn ).fail( errorFn ).always( completeFn );
-};
+	return new AtomicCounterPromiseImpl(promise);
+}
 
 /**
  * Gets the last value previously generated for the specified `counterId`.
- * It returns an AWS-SDK request instance with a jQuery style promise interface applied to it.
- * See [jQuery documentation](http://api.jquery.com/category/deferred-object/) to find out how to attach callbacks
- * to the returned object using the methods: done, fail, always, and then.
+ * It returns a promise-like object with jQuery-style done/fail/always methods.
  *
- * @method getLastValue
- * @param {String} counterId The name or identifier of the counter.
- * @param {Object} options An options object to overwrite some of the default options.
- * @param {String} options.tableName The name of the DynamoDB table that stores the counters. If not specified, it uses "AtomicCounters" by default.
- * @param {String} options.keyAttribute The name of the attribute that stores the counter name/identifier. If not specified, it uses "id" by default.
- * @param {String} options.countAttribute The name of the attribute that stores the last value generated for the specified `counterId`.
- *    If not specified, it uses "lastValue" by default.
- * @param {Function} options.success Success callback function. It receives a single argument: the last value (integer) previously generated
- *    for the specified `counterId`.
- * @param {Function} options.error Error callback function. If the DynamoDB GetItem request fails, the error callback is executed.
- *    It receives a single argument: the error object returned from AWS-SDK or the exception thrown when attempting to parse the response.
- * @param {Function} options.complete Complete callback function. This callback is executed when the GetItem request is completed,
- *    whether or not it was successful. It receives a single argument: a number, if it was successful, or an error object if it failed.
- * @param options.context The context object to use in all callbacks. If specified, the value of `this`
- *    within all callbacks will be `options.context`.
- * @param {Object} options.dynamodb Additional DynamoDB parameters. These parameters will be added to the parameters sent in the
- *    [get item](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/DynamoDB.html#getItem-property) request.
- * @return {Request} A DynamoDB GetItem [request](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/Request.html) object,
- *    with a [jQuery](http://api.jquery.com/category/deferred-object/) style promise interface applied to it.
+ * @param counterId The name or identifier of the counter.
+ * @param options An options object to overwrite some of the default options.
+ * @returns A promise-like object with done/fail/always methods
  */
-exports.getLastValue = function ( counterId, options ) {
-	options || ( options = {} );
+export function getLastValue(counterId: string, options: AtomicCounterOptions = {}): AtomicCounterPromise {
+	const client = getDynamoClient(options.client);
+	const keyAttribute = options.keyAttribute || DEFAULT_KEY_ATTRIBUTE;
+	const countAttribute = options.countAttribute || DEFAULT_COUNT_ATTRIBUTE;
 
-	var request,
-		deferred = new _.Deferred(),
-		keyAttribute = options.keyAttribute || DEFAULT_KEY_ATTRIBUTE,
-		countAttribute = options.countAttribute || DEFAULT_COUNT_ATTRIBUTE,
-		params = {
-			Key: {},
-			AttributesToGet: [ countAttribute ],
-			TableName: options.tableName || DEFAULT_TABLE_NAME
+	const params: GetItemCommandInput = {
+		TableName: options.tableName || DEFAULT_TABLE_NAME,
+		Key: {
+			[keyAttribute]: { S: counterId }
 		},
-		errorFn = _.isFunction( options.error ) ? options.error : noop,
-		successFn = _.isFunction( options.success ) ? options.success : noop,
-		completeFn = _.isFunction( options.complete ) ? options.complete : noop;
+		ProjectionExpression: countAttribute,
+		...options.dynamodb
+	};
 
-	params.Key[ keyAttribute ] = { S: counterId };
-	_.extend( params, options.dynamodb );
+	const promise = new Promise<number>((resolve, reject) => {
+		const command = new GetItemCommand(params);
 
-	dynamo || ( dynamo = new AWS.DynamoDB() );
+		client.send(command)
+			.then((data) => {
+				try {
+					let lastValue: number;
 
-	request = dynamo.getItem(params, function (errorObject, data) {
-		var error, lastValue;
+					if (!data.Item || !data.Item[countAttribute]) {
+						// If the item doesn't exist, return 0
+						lastValue = 0;
+					} else {
+						const countValue = data.Item[countAttribute];
+						if (!countValue.N) {
+							throw new Error('Count attribute is not a number');
+						}
 
-		if ( errorObject ) {
-			error = errorObject;
-		} else if ( _.isEmpty( data ) ) {
-			/**
-			 * If the item doesn't exist, the response would be empty.
-			 * Set `lastValue` to 0 when the item doesn't exist.
-			 */
-			lastValue = 0;
-		} else {
-			try {
-				// Try to parse the count value. An exception will be thrown if it's not a valid number.
-				lastValue = parseInt( data.Item[ countAttribute ].N, 10 );
+						lastValue = parseInt(countValue.N, 10);
 
-				if ( !_.isNumber( lastValue ) || _.isNaN( lastValue ) ) {
-					throw 'Could not parse incremented value (' + lastValue + ').';
+						if (isNaN(lastValue)) {
+							throw new Error(`Could not parse count value (${countValue.N})`);
+						}
+					}
+
+					executeCallback(options.success, options.context, [lastValue]);
+					executeCallback(options.complete, options.context, [lastValue]);
+
+					resolve(lastValue);
+				} catch (error) {
+					executeCallback(options.error, options.context, [error]);
+					executeCallback(options.complete, options.context, [error]);
+					reject(error);
 				}
-			} catch ( e ) {
-				error = e;
-			}
-		}
-
-		if ( error ) {
-			if ( options.context ) {
-				deferred.rejectWith( options.context, [ e ] );
-			} else {
-				deferred.reject( e );
-			}
-		} else {
-			if ( options.context ) {
-				deferred.resolveWith( options.context, [ lastValue ] );
-			} else {
-				deferred.resolve( lastValue );
-			}
-		}
+			})
+			.catch((error) => {
+				executeCallback(options.error, options.context, [error]);
+				executeCallback(options.complete, options.context, [error]);
+				reject(error);
+			});
 	});
 
-	/**
-	 * Apply a promise interface to `request`, set the success, error, and complete callback, and return the promise.
-	 */
-	return deferred.promise( request ).done( successFn ).fail( errorFn ).always( completeFn );
-};
+	return new AtomicCounterPromiseImpl(promise);
+}
+
+/**
+ * Set a custom DynamoDB client instance
+ */
+export function setClient(client: DynamoDBClient): void {
+	dynamoClient = client;
+}
+
+/**
+ * Get the current DynamoDB client instance
+ */
+export function getClient(): DynamoDBClient {
+	return getDynamoClient();
+}
