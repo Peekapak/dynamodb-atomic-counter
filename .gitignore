@@ -1,3 +1,6 @@
+# ignore dist/ files because we will be using this as a submodule rather than as a package
+dist/*
+
 # Logs
 logs
 *.log
