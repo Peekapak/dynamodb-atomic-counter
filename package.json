@@ -19,6 +19,14 @@
   },
   "main": "dist/atomic-counter.js",
   "types": "dist/atomic-counter.d.ts",
+  "module": "dist/atomic-counter.js",
+  "exports": {
+    ".": {
+      "import": "./dist/atomic-counter.js",
+      "require": "./dist/atomic-counter.js",
+      "types": "./dist/atomic-counter.d.ts"
+    }
+  },
   "files": [
     "dist/**/*"
   ],
